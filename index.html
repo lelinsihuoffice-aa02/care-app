@@ -302,32 +302,26 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
          提供跟舊版 GAS 完全相容的 cc(action, params) / lc(payload) 介面，
          讓上面的 React 程式碼完全不用改，只要底層改成直接讀寫 Firestore。
          ============================================================ -->
+    <!-- ============================================================
+         Supabase 直連資料層（取代原本的 Firebase 直連資料層）
+         提供跟舊版完全相容的 cc(action, params) / lc(payload) 介面，
+         讓上面的 React 程式碼完全不用改，只要底層改成直接讀寫 Supabase。
+         ============================================================ -->
     <script type="module">
-      import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
-      import {
-        getAuth, signInWithEmailAndPassword, onAuthStateChanged
-      } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js";
-      import {
-        getFirestore, collection, doc, getDoc, getDocs, setDoc, query, where,
-        documentId, writeBatch, onSnapshot, serverTimestamp
-      } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
+      import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-      // 這組設定是給瀏覽器用的公開設定，本來就會出現在網頁原始碼中，沒關係
-      const firebaseConfig = {
-        apiKey: "AIzaSyB-P4VrvUPtVfc37wDOhQ3UC1rxwTUqMzM",
-        authDomain: "careapp-aa02.firebaseapp.com",
-        projectId: "careapp-aa02",
-        storageBucket: "careapp-aa02.firebasestorage.app",
-        messagingSenderId: "578979676176",
-        appId: "1:578979676176:web:7b35fcb3a1e10573e20a95"
-      };
+      // ⚠️ 請把下面兩個值換成你自己 Supabase 專案的設定
+      // 位置：Supabase Dashboard -> 左下角齒輪 Project Settings -> API
+      // Project URL 貼到 SUPABASE_URL，anon public key 貼到 SUPABASE_ANON_KEY
+      // 這組是給瀏覽器用的公開設定，本來就會出現在網頁原始碼中，沒關係
+      // （真正擋存取的是 Supabase 的 Row Level Security 規則）
+      const SUPABASE_URL = "https://sgzbdbxsbyksrzdfnrhn.supabase.co";
+      const SUPABASE_ANON_KEY = "sb_publishable_xd7Kf7f2Dm7QxjWpd3S9xA_yru6btyy";
 
-      const fbApp = initializeApp(firebaseConfig);
-      const auth = getAuth(fbApp);
-      const db = getFirestore(fbApp);
+      const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
       // 團隊共用的「虛擬帳號」信箱，密碼是大家共用的那組密碼
-      // ⚠️ 這個信箱要事先在 Firebase Console → Authentication → Users 建立好
+      // ⚠️ 這個信箱要事先在 Supabase Dashboard -> Authentication -> Users 建立好
       const SHARED_EMAIL = 'team@careapp-aa02.local';
 
       // ---------- 登入閘門 ----------
@@ -350,9 +344,11 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
       function doLogin() {
         var pw = pwInput.value;
         if (!pw) return;
-        signInWithEmailAndPassword(auth, SHARED_EMAIL, pw).catch(function (err) {
-          document.getElementById('ca-auth-msg').textContent = '密碼錯誤，請再試一次';
-          document.getElementById('ca-auth-msg').style.color = '#c0392b';
+        supabase.auth.signInWithPassword({ email: SHARED_EMAIL, password: pw }).then(function (res) {
+          if (res.error) {
+            document.getElementById('ca-auth-msg').textContent = '密碼錯誤，請再試一次';
+            document.getElementById('ca-auth-msg').style.color = '#c0392b';
+          }
         });
       }
 
@@ -403,8 +399,8 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
         if (rootEl) rootEl.style.visibility = 'visible';
       });
 
-      onAuthStateChanged(auth, function (user) {
-        if (user) {
+      function handleAuthState(session) {
+        if (session) {
           gate.style.display = 'none';
           if (rootEl) rootEl.style.visibility = 'visible';
           ensureUserName();
@@ -416,6 +412,13 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
           gate.style.display = 'flex';
           if (rootEl) rootEl.style.visibility = 'hidden';
         }
+      }
+
+      supabase.auth.getSession().then(function (res) {
+        handleAuthState(res.data && res.data.session);
+      });
+      supabase.auth.onAuthStateChange(function (event, session) {
+        handleAuthState(session);
       });
 
       var lastLocalSaveAt = 0;
@@ -439,55 +442,54 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
       }
 
       function startCloudListener() {
-        var isFirstSnapshot = true;
         var debounceTimer = null;
-
-        onSnapshot(collection(db, 'cases'), function () {
-          if (isFirstSnapshot) {
-            isFirstSnapshot = false;
-            return;
-          }
-          clearTimeout(debounceTimer);
-          debounceTimer = setTimeout(function () {
-            if (Date.now() - lastLocalSaveAt < 8000) return;
-            clickReloadButton();
-          }, 3000);
-        }, function (err) {
-          console.warn('雲端即時監聽失敗（請確認 Firestore Security Rules 或網路連線）：', err);
-        });
+        supabase
+          .channel('cases-changes')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'cases' }, function () {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(function () {
+              if (Date.now() - lastLocalSaveAt < 8000) return;
+              clickReloadButton();
+            }, 3000);
+          })
+          .subscribe(function (status, err) {
+            if (err) console.warn('雲端即時監聽失敗（請確認 Supabase Realtime 設定或網路連線）：', err);
+          });
       }
 
       // ============================================================
-      // 以下：跟舊版 Code.gs 對齊的資料存取層，直接讀寫 Firestore，
+      // 以下：跟舊版 Code.gs / Firebase 版對齊的資料存取層，直接讀寫
+      // Supabase 的 cases / tracking_months / config 三張表，
       // 對外只暴露 cc(action, params) 跟 lc(payload) 兩個函式，
-      // 跟舊版 GAS 的回傳格式完全相容，React 那邊完全不用改。
+      // 跟舊版回傳格式完全相容，React 那邊完全不用改。
       // ============================================================
 
-      const RESERVED_KEY_RE = /^__.*__$/;
-      const KEY_ESCAPE_PREFIX = 'escfld_';
-      function sanitizeForFirestore(obj) {
-        if (Array.isArray(obj)) return obj.map(sanitizeForFirestore);
-        if (obj && typeof obj === 'object') {
-          const out = {};
-          Object.keys(obj).forEach(function (k) {
-            const safeKey = RESERVED_KEY_RE.test(k) ? KEY_ESCAPE_PREFIX + k : k;
-            out[safeKey] = sanitizeForFirestore(obj[k]);
-          });
-          return out;
-        }
-        return obj === undefined ? null : obj;
+      // ---- 列（column）跟前端物件（flat 結構）之間的轉換 ----
+      function rowToCase(row) {
+        var out = Object.assign({}, row.data || {});
+        out.id = row.id;
+        out.closed = !!row.closed;
+        out.updatedAt = row.updated_at || 0;
+        return out;
       }
-      function restoreFromFirestore(obj) {
-        if (Array.isArray(obj)) return obj.map(restoreFromFirestore);
-        if (obj && typeof obj === 'object') {
-          const out = {};
-          Object.keys(obj).forEach(function (k) {
-            const realKey = k.indexOf(KEY_ESCAPE_PREFIX) === 0 ? k.slice(KEY_ESCAPE_PREFIX.length) : k;
-            out[realKey] = restoreFromFirestore(obj[k]);
-          });
-          return out;
-        }
-        return obj;
+      function caseToRow(caseObj) {
+        var data = {};
+        Object.keys(caseObj).forEach(function (k) {
+          if (k !== 'id' && k !== 'closed' && k !== 'updatedAt') data[k] = caseObj[k] === undefined ? null : caseObj[k];
+        });
+        return { id: caseObj.id, closed: !!caseObj.closed, updated_at: caseObj.updatedAt || 0, data: data };
+      }
+      function rowToMonth(row) {
+        var out = Object.assign({}, row.data || {});
+        out.updatedAt = row.updated_at || 0;
+        return out;
+      }
+      function monthToRow(caseId, monthKey, monthObj) {
+        var data = {};
+        Object.keys(monthObj || {}).forEach(function (k) {
+          if (k !== 'updatedAt') data[k] = monthObj[k] === undefined ? null : monthObj[k];
+        });
+        return { case_id: caseId, month_key: monthKey, updated_at: (monthObj && monthObj.updatedAt) || 0, data: data };
       }
 
       function computeMonthSummary(monthKey, monthData) {
@@ -502,82 +504,76 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
         return { monthKey: monthKey, done: done, total: items.length };
       }
 
-      async function chunkedGetByIds(colRef, ids) {
+      async function chunkedSelectByIds(table, idColumn, ids, selectCols) {
         const out = {};
         const chunks = [];
-        for (let i = 0; i < ids.length; i += 30) chunks.push(ids.slice(i, i + 30));
+        for (let i = 0; i < ids.length; i += 200) chunks.push(ids.slice(i, i + 200));
         for (const chunk of chunks) {
           if (!chunk.length) continue;
-          const q = query(colRef, where(documentId(), 'in', chunk));
-          const snap = await getDocs(q);
-          snap.forEach(function (d) { out[d.id] = d.data(); });
+          const { data, error } = await supabase.from(table).select(selectCols).in(idColumn, chunk);
+          if (error) throw error;
+          (data || []).forEach(function (row) { out[row[idColumn]] = row; });
         }
         return out;
       }
 
       async function loadCases(params) {
-        const casesCol = collection(db, 'cases');
-        let snap;
-        if (params && params.since) {
-          const q = query(casesCol, where('updatedAt', '>', Number(params.since)));
-          snap = await getDocs(q);
-        } else {
-          snap = await getDocs(casesCol);
+        params = params || {};
+        let query = supabase.from('cases').select('*');
+        if (params.since) {
+          query = query.gt('updated_at', Number(params.since));
         }
-        let cases = [];
-        snap.forEach(function (d) {
-          const c = restoreFromFirestore(d.data());
-          c.id = c.id || d.id;
-          cases.push(c);
-        });
-        const onlyActive = !(params && params.all === '1');
-        if (!params || !params.since) {
+        const { data, error } = await query;
+        if (error) throw error;
+        let cases = (data || []).map(rowToCase);
+        const onlyActive = !(params.all === '1');
+        if (!params.since) {
           if (onlyActive) cases = cases.filter(function (c) { return !c.closed; });
         }
-        return { cases: cases, incremental: !!(params && params.since), source: 'firestore', serverTime: Date.now() };
+        return { cases: cases, incremental: !!params.since, source: 'firestore', serverTime: Date.now() };
       }
 
       async function loadCaseMonths(caseId) {
-        const snap = await getDocs(collection(db, 'cases', caseId, 'trackingMonths'));
+        const { data, error } = await supabase.from('tracking_months').select('*').eq('case_id', caseId);
+        if (error) throw error;
         const out = {};
-        snap.forEach(function (d) { out[d.id] = restoreFromFirestore(d.data()); });
+        (data || []).forEach(function (row) { out[row.month_key] = rowToMonth(row); });
         return { caseId: caseId, months: out, source: 'firestore' };
       }
 
       async function loadManyCaseMonths(caseIdsStr) {
         const ids = (caseIdsStr || '').split(',').filter(Boolean);
         const out = {};
-        for (const id of ids) {
-          const snap = await getDocs(collection(db, 'cases', id, 'trackingMonths'));
-          const months = {};
-          snap.forEach(function (d) { months[d.id] = restoreFromFirestore(d.data()); });
-          out[id] = months;
-        }
+        if (!ids.length) return { months: out, source: 'firestore' };
+        const { data, error } = await supabase.from('tracking_months').select('*').in('case_id', ids);
+        if (error) throw error;
+        (data || []).forEach(function (row) {
+          if (!out[row.case_id]) out[row.case_id] = {};
+          out[row.case_id][row.month_key] = rowToMonth(row);
+        });
         return { months: out, source: 'firestore' };
       }
 
       async function loadConfig() {
-        const snap = await getDoc(doc(db, 'config', 'meta'));
-        const data = snap.exists()
-          ? restoreFromFirestore(snap.data())
-          : { cms: [], units: {}, templates: {}, svcCodes: [], regionMap: [] };
-        data.source = 'firestore';
-        return data;
+        const { data, error } = await supabase.from('config').select('*').eq('id', 'meta').maybeSingle();
+        if (error) throw error;
+        const result = data ? Object.assign({}, data.data) : { cms: [], units: {}, templates: {}, svcCodes: [], regionMap: [] };
+        result.source = 'firestore';
+        return result;
       }
 
       async function getStatus() {
-        const snap = await getDoc(doc(db, 'config', 'status'));
-        if (!snap.exists()) return { lastSavedAt: null, lastSavedBy: null, lastSavedByName: null };
-        const d = snap.data();
+        const { data, error } = await supabase.from('config').select('*').eq('id', 'status').maybeSingle();
+        if (error) throw error;
+        if (!data) return { lastSavedAt: null, lastSavedBy: null, lastSavedByName: null };
+        const d = data.data || {};
         return { lastSavedAt: d.lastSavedAt || null, lastSavedBy: d.lastSavedBy || null, lastSavedByName: d.lastSavedByName || null };
       }
 
       async function touchStatus(clientId, who) {
-        await setDoc(doc(db, 'config', 'status'), {
-          lastSavedAt: new Date().toISOString(),
-          lastSavedBy: clientId || 'unknown',
-          lastSavedByName: who || ''
-        }, { merge: true });
+        const payload = { lastSavedAt: new Date().toISOString(), lastSavedBy: clientId || 'unknown', lastSavedByName: who || '' };
+        const { error } = await supabase.from('config').upsert({ id: 'status', updated_at: Date.now(), data: payload });
+        if (error) throw error;
       }
 
       // ---- cc(action, params)：對應舊版 doGet ----
@@ -600,10 +596,10 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
       // ---- saveCase：單筆個案（含樂觀鎖 updatedAt 比對） ----
       async function saveCaseOne(caseData) {
         if (!caseData || !caseData.id) throw new Error('saveCase 缺少 id');
-        const ref = doc(db, 'cases', caseData.id);
-        const existing = await getDoc(ref);
-        if (existing.exists()) {
-          const existingTime = existing.data().updatedAt || 0;
+        const { data: existing, error: selErr } = await supabase.from('cases').select('updated_at').eq('id', caseData.id).maybeSingle();
+        if (selErr) throw selErr;
+        if (existing) {
+          const existingTime = existing.updated_at || 0;
           const incomingTime = caseData.updatedAt || 0;
           if (existingTime > incomingTime) {
             throw new Error('CONFLICT：這筆個案雲端上已經有更新版本，請重新整理後再編輯一次。');
@@ -612,34 +608,39 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
         const toSave = {};
         Object.keys(caseData).forEach(function (k) { if (k !== 'trackingMonths') toSave[k] = caseData[k]; });
         toSave.updatedAt = Date.now();
-        await setDoc(ref, sanitizeForFirestore(toSave), { merge: true });
+        const { error } = await supabase.from('cases').upsert(caseToRow(toSave));
+        if (error) throw error;
         return toSave;
       }
 
       // ---- saveMonth：單一個案單一月份追蹤 ----
       async function saveCaseMonth(caseId, monthKey, monthData) {
         if (!caseId || !monthKey) throw new Error('saveCaseMonth 缺少 caseId 或 monthKey');
-        const ref = doc(db, 'cases', caseId, 'trackingMonths', monthKey);
-        const existing = await getDoc(ref);
-        if (existing.exists()) {
-          const existingTime = existing.data().updatedAt || 0;
+        const { data: existing, error: selErr } = await supabase.from('tracking_months').select('updated_at').eq('case_id', caseId).eq('month_key', monthKey).maybeSingle();
+        if (selErr) throw selErr;
+        if (existing) {
+          const existingTime = existing.updated_at || 0;
           const incomingTime = (monthData && monthData.updatedAt) || 0;
           if (existingTime > incomingTime) {
             throw new Error('CONFLICT：這份月份紀錄雲端上已經有更新版本，請重新整理後再編輯一次。');
           }
         }
         const toSave = Object.assign({}, monthData, { updatedAt: Date.now() });
-        await setDoc(ref, sanitizeForFirestore(toSave), { merge: true });
+        const { error } = await supabase.from('tracking_months').upsert(monthToRow(caseId, monthKey, toSave));
+        if (error) throw error;
         try {
           const summary = computeMonthSummary(monthKey, toSave);
-          await setDoc(doc(db, 'cases', caseId), { monthSummary: summary }, { merge: true });
+          const { data: caseRow } = await supabase.from('cases').select('data').eq('id', caseId).maybeSingle();
+          const newData = Object.assign({}, (caseRow && caseRow.data) || {}, { monthSummary: summary });
+          await supabase.from('cases').update({ data: newData }).eq('id', caseId);
         } catch (err) { /* 摘要更新失敗不影響月份資料本身，安靜略過 */ }
         return toSave;
       }
 
       // ---- saveConfig ----
       async function saveConfigDoc(config) {
-        await setDoc(doc(db, 'config', 'meta'), sanitizeForFirestore(config || {}), { merge: true });
+        const { error } = await supabase.from('config').upsert({ id: 'meta', updated_at: Date.now(), data: config || {} });
+        if (error) throw error;
         return config;
       }
 
@@ -648,14 +649,13 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
         const validCases = (cases || []).filter(function (c) { return c && c.id; });
         const validMonths = (months || []).filter(function (m) { return m && m.caseId && m.monthKey; });
 
-        const casesCol = collection(db, 'cases');
-        const existingCaseMap = await chunkedGetByIds(casesCol, validCases.map(function (c) { return c.id; }));
+        const existingCaseMap = await chunkedSelectByIds('cases', 'id', validCases.map(function (c) { return c.id; }), 'id,updated_at');
 
         const monthExistingMap = {};
         for (const m of validMonths) {
-          const ref = doc(db, 'cases', m.caseId, 'trackingMonths', m.monthKey);
-          const snap = await getDoc(ref);
-          monthExistingMap[m.caseId + '/' + m.monthKey] = snap.exists() ? snap.data() : null;
+          const { data, error } = await supabase.from('tracking_months').select('updated_at').eq('case_id', m.caseId).eq('month_key', m.monthKey).maybeSingle();
+          if (error) throw error;
+          monthExistingMap[m.caseId + '/' + m.monthKey] = data || null;
         }
 
         const now = Date.now();
@@ -664,7 +664,7 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
 
         validCases.forEach(function (c) {
           const existing = existingCaseMap[c.id];
-          const existingTime = (existing && existing.updatedAt) || 0;
+          const existingTime = (existing && existing.updated_at) || 0;
           const incomingTime = c.updatedAt || 0;
           if (existingTime > incomingTime) {
             conflicts.push({ type: 'case', id: c.id, name: c.name || c.id });
@@ -681,7 +681,7 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
         validMonths.forEach(function (m) {
           const key = m.caseId + '/' + m.monthKey;
           const existing = monthExistingMap[key];
-          const existingTime = (existing && existing.updatedAt) || 0;
+          const existingTime = (existing && existing.updated_at) || 0;
           const parentCase = validCases.filter(function (c) { return c.id === m.caseId; })[0];
           const incomingTime = (parentCase && parentCase.updatedAt) || 0;
           if (existingTime > incomingTime) {
@@ -700,28 +700,29 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
           }
         });
 
-        // Firestore 一個 batch 最多 500 個寫入操作，這裡分批送出
-        let allWrites = [];
-        Object.keys(caseWriteToSave).forEach(function (caseId) {
-          allWrites.push({ ref: doc(db, 'cases', caseId), data: sanitizeForFirestore(caseWriteToSave[caseId]) });
-        });
-        monthWrites.forEach(function (m) {
-          allWrites.push({ ref: doc(db, 'cases', m.caseId, 'trackingMonths', m.monthKey), data: sanitizeForFirestore(m.data) });
-        });
-        // 沒有完整個案寫入、但需要單獨補上 monthSummary 的情況
-        Object.keys(monthSummaryPatchByCase).forEach(function (caseId) {
+        // 沒有完整個案寫入、但需要單獨補上 monthSummary 的情況：先讀現有 data 再合併寫回
+        for (const caseId of Object.keys(monthSummaryPatchByCase)) {
           if (!caseWriteToSave[caseId]) {
-            allWrites.push({ ref: doc(db, 'cases', caseId), data: { monthSummary: monthSummaryPatchByCase[caseId] } });
+            const { data: existingRow } = await supabase.from('cases').select('data').eq('id', caseId).maybeSingle();
+            const mergedData = Object.assign({}, (existingRow && existingRow.data) || {}, { monthSummary: monthSummaryPatchByCase[caseId] });
+            await supabase.from('cases').update({ data: mergedData }).eq('id', caseId);
           }
-        });
-
-        for (let i = 0; i < allWrites.length; i += 400) {
-          const batch = writeBatch(db);
-          allWrites.slice(i, i + 400).forEach(function (w) { batch.set(w.ref, w.data, { merge: true }); });
-          await batch.commit();
         }
 
-        return { casesSaved: allWrites.length, monthsSaved: validMonths.length, conflicts: conflicts };
+        const caseRowsToUpsert = Object.keys(caseWriteToSave).map(function (caseId) { return caseToRow(caseWriteToSave[caseId]); });
+        const monthRowsToUpsert = monthWrites.map(function (m) { return monthToRow(m.caseId, m.monthKey, m.data); });
+
+        // 分批 upsert，避免單次請求過大
+        for (let i = 0; i < caseRowsToUpsert.length; i += 400) {
+          const { error } = await supabase.from('cases').upsert(caseRowsToUpsert.slice(i, i + 400));
+          if (error) throw error;
+        }
+        for (let i = 0; i < monthRowsToUpsert.length; i += 400) {
+          const { error } = await supabase.from('tracking_months').upsert(monthRowsToUpsert.slice(i, i + 400));
+          if (error) throw error;
+        }
+
+        return { casesSaved: caseRowsToUpsert.length + monthRowsToUpsert.length, monthsSaved: validMonths.length, conflicts: conflicts };
       }
 
       // ---- lc(payload)：對應舊版 doPost ----
