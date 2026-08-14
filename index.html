@@ -616,7 +616,7 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
         const toSave = {};
         Object.keys(caseData).forEach(function (k) { if (k !== 'trackingMonths') toSave[k] = caseData[k]; });
         toSave.updatedAt = Date.now();
-        const { data: savedRow, error } = await supabase.from('cases').upsert(caseToRow(toSave)).select('updated_at').maybeSingle();
+        const { data: savedRow, error } = await supabase.from('cases').upsert(caseToRow(toSave), { onConflict: 'id' }).select('updated_at,data').maybeSingle();
         if (error) throw error;
         toSave.updatedAt = (savedRow && savedRow.updated_at) || toSave.updatedAt;
         return toSave;
@@ -643,7 +643,7 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
           }
         }
         const toSave = Object.assign({}, monthData, { updatedAt: Date.now() });
-        const { data: savedRow, error } = await supabase.from('tracking_months').upsert(monthToRow(caseId, monthKey, toSave)).select('updated_at').maybeSingle();
+        const { data: savedRow, error } = await supabase.from('tracking_months').upsert(monthToRow(caseId, monthKey, toSave), { onConflict: 'case_id,month_key' }).select('updated_at,data').maybeSingle();
         if (error) throw error;
         toSave.updatedAt = (savedRow && savedRow.updated_at) || toSave.updatedAt;
         try {
@@ -743,13 +743,13 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
         // 分批 upsert，避免單次請求過大；同時把資料庫真正產生的 updated_at 收集回來
         const caseUpdatedAtById = {};
         for (let i = 0; i < caseRowsToUpsert.length; i += 400) {
-          const { data: savedRows, error } = await supabase.from('cases').upsert(caseRowsToUpsert.slice(i, i + 400)).select('id,updated_at');
+          const { data: savedRows, error } = await supabase.from('cases').upsert(caseRowsToUpsert.slice(i, i + 400), { onConflict: 'id' }).select('id,updated_at,data');
           if (error) throw error;
           (savedRows || []).forEach(function (r) { caseUpdatedAtById[r.id] = r.updated_at; });
         }
         const monthUpdatedAtByKey = {};
         for (let i = 0; i < monthRowsToUpsert.length; i += 400) {
-          const { data: savedRows, error } = await supabase.from('tracking_months').upsert(monthRowsToUpsert.slice(i, i + 400)).select('case_id,month_key,updated_at');
+          const { data: savedRows, error } = await supabase.from('tracking_months').upsert(monthRowsToUpsert.slice(i, i + 400), { onConflict: 'case_id,month_key' }).select('case_id,month_key,updated_at,data');
           if (error) throw error;
           (savedRows || []).forEach(function (r) { monthUpdatedAtByKey[r.case_id + '/' + r.month_key] = r.updated_at; });
         }
