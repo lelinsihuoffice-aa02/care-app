@@ -837,49 +837,71 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
       // ============================================================
       const DIAG_TEST_ID = '__diagnostic_test__';
 
-      async function runDiagnostics() {
-        const report = [];
+      // 幫每個檢查項目加上逾時保護：如果專案被 Supabase 免費方案自動暫停，
+      // 請求會整個卡住、遲遲沒有回應也沒有錯誤，使用者只會看到「一直轉圈」，
+      // 完全不知道發生什麼事。這裡設 10 秒逾時，一旦真的卡住會直接告訴使用者最可能的原因。
+      function withTimeout(promise, ms, label) {
+        return Promise.race([
+          promise,
+          new Promise(function (_, reject) {
+            setTimeout(function () { reject(new Error(label + ' 逾時（超過 ' + (ms / 1000) + ' 秒沒回應），很可能是 Supabase 免費方案專案已閒置暫停，請到 Dashboard 手動按 Resume/Restore 後再試一次')); }, ms);
+          }),
+        ]);
+      }
 
-        // 1) 登入狀態
-        const sessionRes = await supabase.auth.getSession();
-        const session = sessionRes.data && sessionRes.data.session;
-        report.push({
-          name: '登入狀態',
-          ok: !!session,
-          message: session ? ('已登入：' + session.user.email) : '尚未登入（未取得 session，RLS 會擋下所有需要登入才能存取的資料）',
+      async function runDiagnostics() {
+        const startedAt = Date.now();
+
+        // 1) 登入狀態、2) 三張表讀取、3) 寫入測試 —— 全部同時平行送出，
+        // 不再一個一個排隊等，原本要等 6 次來回，現在只要等最慢的那一次。
+        const sessionCheck = withTimeout(supabase.auth.getSession(), 10000, '登入狀態查詢')
+          .then(function (sessionRes) {
+            const session = sessionRes.data && sessionRes.data.session;
+            return { name: '登入狀態', ok: !!session, message: session ? ('已登入：' + session.user.email) : '尚未登入（未取得 session，RLS 會擋下所有需要登入才能存取的資料）' };
+          })
+          .catch(function (err) {
+            return { name: '登入狀態', ok: false, message: err && err.message };
+          });
+
+        const tableChecks = ['cases', 'tracking_months', 'config'].map(function (table) {
+          return withTimeout(supabase.from(table).select('*', { count: 'exact', head: true }), 10000, '讀取資料表 ' + table)
+            .then(function (res) {
+              if (res.error) throw res.error;
+              return { name: '讀取資料表：' + table, ok: true, message: '可以讀取，目前共 ' + res.count + ' 筆資料' };
+            })
+            .catch(function (err) {
+              return {
+                name: '讀取資料表：' + table,
+                ok: false,
+                message: (err && err.message) + (err && err.hint ? '（提示：' + err.hint + '）' : '') + '｜很可能是資料表不存在，或 Row Level Security 沒有開放 SELECT 權限',
+              };
+            });
         });
 
-        // 2) 三張表分別測試「讀取」
-        for (const table of ['cases', 'tracking_months', 'config']) {
-          try {
-            const { count, error } = await supabase.from(table).select('*', { count: 'exact', head: true });
-            if (error) throw error;
-            report.push({ name: '讀取資料表：' + table, ok: true, message: '可以讀取，目前共 ' + count + ' 筆資料' });
-          } catch (err) {
-            report.push({
-              name: '讀取資料表：' + table,
+        const writeCheck = withTimeout(
+          (async function () {
+            const { error: upsertErr } = await supabase
+              .from('config')
+              .upsert({ id: DIAG_TEST_ID, updated_at: Date.now(), data: { diagnostic: true, at: new Date().toISOString() } });
+            if (upsertErr) throw upsertErr;
+            const { error: deleteErr } = await supabase.from('config').delete().eq('id', DIAG_TEST_ID);
+            if (deleteErr) throw deleteErr;
+          })(),
+          10000,
+          '寫入權限測試'
+        )
+          .then(function () { return { name: '寫入權限測試', ok: true, message: '可以正常寫入 / 刪除資料' }; })
+          .catch(function (err) {
+            return {
+              name: '寫入權限測試',
               ok: false,
-              message: (err && err.message) + (err && err.hint ? '（提示：' + err.hint + '）' : '') + '｜很可能是資料表不存在，或 Row Level Security 沒有開放 SELECT 權限',
-            });
-          }
-        }
-
-        // 3) 實際測試「寫入」權限：寫一筆測試資料到 config 表，成功後立刻刪除，不留痕跡
-        try {
-          const { error: upsertErr } = await supabase
-            .from('config')
-            .upsert({ id: DIAG_TEST_ID, updated_at: Date.now(), data: { diagnostic: true, at: new Date().toISOString() } });
-          if (upsertErr) throw upsertErr;
-          const { error: deleteErr } = await supabase.from('config').delete().eq('id', DIAG_TEST_ID);
-          if (deleteErr) throw deleteErr;
-          report.push({ name: '寫入權限測試', ok: true, message: '可以正常寫入 / 刪除資料' });
-        } catch (err) {
-          report.push({
-            name: '寫入權限測試',
-            ok: false,
-            message: (err && err.message) + (err && err.hint ? '（提示：' + err.hint + '）' : '') + '｜最常見原因：Row Level Security 沒有開放 INSERT/UPDATE 權限給登入後的使用者',
+              message: (err && err.message) + (err && err.hint ? '（提示：' + err.hint + '）' : '') + '｜最常見原因：Row Level Security 沒有開放 INSERT/UPDATE 權限給登入後的使用者',
+            };
           });
-        }
+
+        const report = await Promise.all([sessionCheck].concat(tableChecks).concat([writeCheck]));
+        const elapsedMs = Date.now() - startedAt;
+        report.push({ name: '本次檢查耗時', ok: elapsedMs < 3000, message: elapsedMs + ' 毫秒' + (elapsedMs >= 3000 ? '｜偏慢，若每次都這樣，可能是網路狀況不佳或專案剛從暫停狀態醒來' : '') });
 
         console.group('%c[雲端診斷報告]', 'color:#7C9473;font-weight:bold;');
         report.forEach(function (r) { console.log((r.ok ? '✅ ' : '❌ ') + r.name + '：' + r.message); });
