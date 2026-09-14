@@ -613,13 +613,18 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
       // 所以這裡不需要再檢查/補建案主資料，兩張表完全獨立存取。
       async function saveCaseMonth(caseId, monthKey, monthData) {
         if (!caseId || !monthKey) throw new Error('saveCaseMonth 缺少 caseId 或 monthKey');
-        const { data: existing, error: selErr } = await supabase.from('tracking_months').select('updated_at').eq('case_id', caseId).eq('month_key', monthKey).maybeSingle();
+        const { data: existing, error: selErr } = await supabase.from('tracking_months').select('updated_at,data').eq('case_id', caseId).eq('month_key', monthKey).maybeSingle();
         if (selErr) throw selErr;
         if (existing) {
           const existingTime = existing.updated_at || 0;
           const incomingTime = (monthData && monthData.updatedAt) || 0;
           if (existingTime > incomingTime) {
             throw new Error('CONFLICT：這份月份紀錄雲端上已經有更新版本，請重新整理後再編輯一次。');
+          }
+          // 安全防線：雲端已經有實際內容，但這次要存的資料是空的 → 擋下來，避免不明原因的
+          // 空白狀態把既有資料洗掉（例如頁面切換時，畫面資料還沒真正載入完成就被存了上去）。
+          if (!isEffectivelyEmptyMonthData(existing.data) && isEffectivelyEmptyMonthData(monthData)) {
+            throw new Error('BLOCKED_BLANK_OVERWRITE：偵測到即將用空白資料覆蓋雲端既有內容，已自動擋下未寫入，請確認畫面資料是否正確載入後再試一次。');
           }
         }
         const toSave = Object.assign({}, monthData, { updatedAt: Date.now() });
@@ -703,6 +708,22 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
         return Object.assign({}, toSave, { updatedAt: (saved && saved.updated_at) || 0 });
       }
 
+      // 偵測「這筆月份資料是不是空的」：用來擋下「有內容的資料被空白覆蓋」這種最危險的寫入。
+      // 判斷方式很保守：只要有任何一個欄位有實質內容（非空字串、非空陣列、非空物件），
+      // 就不算空白；updatedAt 這個時間戳欄位本身不算內容。
+      function isEffectivelyEmptyMonthData(data) {
+        if (!data || typeof data !== 'object') return true;
+        const keys = Object.keys(data).filter(function (k) { return k !== 'updatedAt'; });
+        if (keys.length === 0) return true;
+        return keys.every(function (k) {
+          const v = data[k];
+          if (v === null || v === undefined || v === '') return true;
+          if (Array.isArray(v)) return v.length === 0;
+          if (typeof v === 'object') return Object.keys(v).length === 0;
+          return false;
+        });
+      }
+
       // ---- saveBatch：對應舊版 saveBatch_，只寫入真正有異動的個案/月份 ----
       async function saveBatchAll(cases, months) {
         const validCases = (cases || []).filter(function (c) { return c && c.id; });
@@ -712,7 +733,7 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
 
         const monthExistingMap = {};
         for (const m of validMonths) {
-          const { data, error } = await supabase.from('tracking_months').select('updated_at').eq('case_id', m.caseId).eq('month_key', m.monthKey).maybeSingle();
+          const { data, error } = await supabase.from('tracking_months').select('updated_at,data').eq('case_id', m.caseId).eq('month_key', m.monthKey).maybeSingle();
           if (error) throw error;
           monthExistingMap[m.caseId + '/' + m.monthKey] = data || null;
         }
@@ -752,6 +773,14 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
           if (existingTime > incomingTime) {
             const label = (parentCase && parentCase.name || m.caseId) + ' ' + m.monthKey;
             conflicts.push({ type: 'month', id: m.caseId + '/' + m.monthKey, name: label });
+            return;
+          }
+          // 安全防線：雲端這個月份已經有實際內容，但這次要存的資料是空的 → 很可能是前端在
+          // 尚未載入完成、或某個導覽動作誤觸的情況下存了一份空白狀態上來，不是使用者真的要清空，
+          // 直接擋下，不寫入，並記到 conflicts 讓呼叫端知道「有資料被保護、沒有真的存空白進去」。
+          if (existing && !isEffectivelyEmptyMonthData(existing.data) && isEffectivelyEmptyMonthData(m.data)) {
+            const label = (parentCase && parentCase.name || m.caseId) + ' ' + m.monthKey;
+            conflicts.push({ type: 'month-blank-blocked', id: m.caseId + '/' + m.monthKey, name: label, reason: '偵測到即將用空白資料覆蓋雲端既有內容，已自動擋下未寫入' });
             return;
           }
           const toSave = Object.assign({}, m.data || {}, { updatedAt: now });
