@@ -863,168 +863,109 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
       }
 
       // ============================================================
-      // 雲端連線診斷面板：因為存檔失敗現在大多是「安靜失敗」（例如 RLS 政策擋下寫入時，
-      // 一般使用者不會去看瀏覽器主控台），加一個畫面上看得到的檢查工具，
-      // 點一下就能看到「登入狀態／三張表能不能讀／能不能寫」，一次抓出真正卡住的地方。
+      // 強制還原備份：只有在雲端資料因為某些原因（例如前面抓到的存檔 bug）
+      // 變得比手邊的備份檔案還糟時才使用。會完全略過「比時間戳新舊」「擋空白覆蓋」
+      // 這些平常的保護機制，直接把備份檔案的內容蓋掉雲端現在的版本，
+      // 並且把還原後資料的時間戳都設成「現在」，這樣之後其他裝置再同步時，
+      // 才不會因為它們手上還留著舊快取、時間戳比較舊，反而又把這次還原的結果蓋掉。
       // ============================================================
-      const DIAG_TEST_ID = '__diagnostic_test__';
+      async function forceRestoreFromBackup(backupObj) {
+        const cases = (backupObj && backupObj.cases) || [];
+        if (!Array.isArray(cases) || cases.length === 0) {
+          throw new Error('備份檔案格式不正確，找不到 cases 陣列');
+        }
+        const now = Date.now();
 
-      // 幫每個檢查項目加上逾時保護：如果專案被 Supabase 免費方案自動暫停，
-      // 請求會整個卡住、遲遲沒有回應也沒有錯誤，使用者只會看到「一直轉圈」，
-      // 完全不知道發生什麼事。這裡設 10 秒逾時，一旦真的卡住會直接告訴使用者最可能的原因。
-      function withTimeout(promise, ms, label) {
-        return Promise.race([
-          promise,
-          new Promise(function (_, reject) {
-            setTimeout(function () { reject(new Error(label + ' 逾時（超過 ' + (ms / 1000) + ' 秒沒回應），很可能是 Supabase 免費方案專案已閒置暫停，請到 Dashboard 手動按 Resume/Restore 後再試一次')); }, ms);
-          }),
-        ]);
-      }
+        const caseRows = cases
+          .filter(function (c) { return c && c.id; })
+          .map(function (c) { return caseToRow(Object.assign({}, c, { updatedAt: now })); });
 
-      async function runDiagnostics() {
-        const startedAt = Date.now();
-
-        // 1) 登入狀態、2) 三張表讀取、3) 寫入測試 —— 全部同時平行送出，
-        // 不再一個一個排隊等，原本要等 6 次來回，現在只要等最慢的那一次。
-        const sessionCheck = withTimeout(supabase.auth.getSession(), 10000, '登入狀態查詢')
-          .then(function (sessionRes) {
-            const session = sessionRes.data && sessionRes.data.session;
-            return { name: '登入狀態', ok: !!session, message: session ? ('已登入：' + session.user.email) : '尚未登入（未取得 session，RLS 會擋下所有需要登入才能存取的資料）' };
-          })
-          .catch(function (err) {
-            return { name: '登入狀態', ok: false, message: err && err.message };
+        const monthRows = [];
+        cases.forEach(function (c) {
+          if (!c || !c.id || !c.trackingMonths) return;
+          Object.keys(c.trackingMonths).forEach(function (monthKey) {
+            monthRows.push(monthToRow(c.id, monthKey, Object.assign({}, c.trackingMonths[monthKey], { updatedAt: now })));
           });
-
-        const tableChecks = ['cases', 'tracking_months', 'config'].map(function (table) {
-          return withTimeout(supabase.from(table).select('*', { count: 'exact', head: true }), 10000, '讀取資料表 ' + table)
-            .then(function (res) {
-              if (res.error) throw res.error;
-              return { name: '讀取資料表：' + table, ok: true, message: '可以讀取，目前共 ' + res.count + ' 筆資料' };
-            })
-            .catch(function (err) {
-              return {
-                name: '讀取資料表：' + table,
-                ok: false,
-                message: (err && err.message) + (err && err.hint ? '（提示：' + err.hint + '）' : '') + '｜很可能是資料表不存在，或 Row Level Security 沒有開放 SELECT 權限',
-              };
-            });
         });
 
-        const writeCheck = withTimeout(
-          (async function () {
-            const { error: upsertErr } = await supabase
-              .from('config')
-              .upsert({ id: DIAG_TEST_ID, updated_at: Date.now(), data: { diagnostic: true, at: new Date().toISOString() } });
-            if (upsertErr) throw upsertErr;
-            const { error: deleteErr } = await supabase.from('config').delete().eq('id', DIAG_TEST_ID);
-            if (deleteErr) throw deleteErr;
-          })(),
-          10000,
-          '寫入權限測試'
-        )
-          .then(function () { return { name: '寫入權限測試', ok: true, message: '可以正常寫入 / 刪除資料' }; })
-          .catch(function (err) {
-            return {
-              name: '寫入權限測試',
-              ok: false,
-              message: (err && err.message) + (err && err.hint ? '（提示：' + err.hint + '）' : '') + '｜最常見原因：Row Level Security 沒有開放 INSERT/UPDATE 權限給登入後的使用者',
-            };
+        for (let i = 0; i < caseRows.length; i += 400) {
+          const { error } = await supabase.from('cases').upsert(caseRows.slice(i, i + 400), { onConflict: 'id' });
+          if (error) throw error;
+        }
+        for (let i = 0; i < monthRows.length; i += 400) {
+          const { error } = await supabase.from('tracking_months').upsert(monthRows.slice(i, i + 400), { onConflict: 'case_id,month_key' });
+          if (error) throw error;
+        }
+
+        // 共用設定（個管名單／單位／範本／服務代碼等）一併還原，直接整份覆蓋、不做合併
+        const metaKeys = ['cms', 'units', 'templates', 'svcCodes', 'regionMap'];
+        const hasMeta = metaKeys.some(function (k) { return backupObj[k] !== undefined; });
+        if (hasMeta) {
+          const metaData = {};
+          metaKeys.forEach(function (k) {
+            metaData[k] = backupObj[k] !== undefined ? backupObj[k] : (k === 'units' || k === 'templates' ? {} : []);
           });
+          const { error } = await supabase.from('config').upsert({ id: 'meta', updated_at: now, data: metaData });
+          if (error) throw error;
+        }
 
-        const report = await Promise.all([sessionCheck].concat(tableChecks).concat([writeCheck]));
-        const elapsedMs = Date.now() - startedAt;
-        report.push({ name: '本次檢查耗時', ok: elapsedMs < 3000, message: elapsedMs + ' 毫秒' + (elapsedMs >= 3000 ? '｜偏慢，若每次都這樣，可能是網路狀況不佳或專案剛從暫停狀態醒來' : '') });
-
-        console.group('%c[雲端診斷報告]', 'color:#7C9473;font-weight:bold;');
-        report.forEach(function (r) { console.log((r.ok ? '✅ ' : '❌ ') + r.name + '：' + r.message); });
-        console.groupEnd();
-
-        return report;
+        return { casesRestored: caseRows.length, monthsRestored: monthRows.length, metaRestored: hasMeta };
       }
 
-      function renderDiagnosticReport(report) {
-        const box = document.getElementById('ca-diag-body');
-        if (!box) return;
-        const allOk = report.every(function (r) { return r.ok; });
-        box.innerHTML =
-          '<div style="font-size:12px;color:#8C8071;margin-bottom:12px;">' +
-            (allOk ? '✅ 全部檢查通過。如果存檔仍然沒反應，請直接按 F12 開主控台，操作一次存檔，把出現的紅字錯誤複製給開發者。'
-                   : '⚠️ 下面標示 ❌ 的項目就是資料存不進雲端的原因，請把整個訊息截圖或複製給開發者。') +
-          '</div>' +
-          report.map(function (r) {
-            return '<div style="padding:8px 10px;margin-bottom:6px;border-radius:8px;background:' + (r.ok ? '#F1F6EE' : '#FDECEC') + ';">' +
-              '<div style="font-size:13px;font-weight:700;color:' + (r.ok ? '#4C6B43' : '#c0392b') + ';">' + (r.ok ? '✅ ' : '❌ ') + r.name + '</div>' +
-              '<div style="font-size:12px;color:#5C5347;margin-top:2px;word-break:break-all;">' + r.message + '</div>' +
-            '</div>';
-          }).join('');
-      }
+      let restoreToolCreated = false;
+      function createRestoreTool() {
+        if (restoreToolCreated) return;
+        restoreToolCreated = true;
 
-      function createDiagnosticPanel() {
         const btn = document.createElement('button');
-        btn.id = 'ca-diag-btn';
-        btn.textContent = '🔍 雲端狀態';
-        btn.style.cssText = 'position:fixed;bottom:10px;left:8px;z-index:9998;background:rgba(255,255,255,0.9);border:1px solid #E4D5BE;border-radius:10px;padding:5px 10px;font-size:11px;color:#5C5347;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.08);';
+        btn.id = 'ca-restore-btn';
+        btn.textContent = '還原備份';
+        btn.title = '從 JSON 備份檔強制還原雲端資料（會覆蓋現有資料，請小心使用）';
+        btn.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:9998;background:rgba(255,255,255,0.75);border:1px solid #e2c5a5;border-radius:8px;padding:3px 8px;font-size:10px;color:#a08050;cursor:pointer;opacity:0.5;';
+        btn.addEventListener('mouseenter', function () { btn.style.opacity = '1'; });
+        btn.addEventListener('mouseleave', function () { btn.style.opacity = '0.5'; });
         document.body.appendChild(btn);
 
-        const modal = document.createElement('div');
-        modal.id = 'ca-diag-modal';
-        modal.style.cssText = 'display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:99997;align-items:center;justify-content:center;font-family:"Noto Sans TC",system-ui,sans-serif;padding:16px;';
-        modal.innerHTML =
-          '<div style="background:#fff;border-radius:16px;padding:20px;max-width:420px;width:100%;max-height:80vh;overflow:auto;">' +
-            '<div style="font-size:15px;font-weight:700;color:#7C9473;margin-bottom:10px;">雲端連線診斷</div>' +
-            '<div id="ca-diag-body" style="font-size:12px;color:#8C8071;">檢查中...</div>' +
-            '<button id="ca-diag-recheck" style="margin-top:12px;width:100%;background:#F1F6EE;color:#4C6B43;border:1px solid #cfe0c8;padding:8px;border-radius:10px;cursor:pointer;font-size:13px;">重新檢查</button>' +
-            '<button id="ca-diag-close" style="margin-top:8px;width:100%;background:#f4f0e9;color:#5C5347;border:none;padding:8px;border-radius:10px;cursor:pointer;font-size:13px;">關閉</button>' +
-          '</div>';
-        document.body.appendChild(modal);
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = '.json,application/json';
+        fileInput.style.display = 'none';
+        document.body.appendChild(fileInput);
 
-        async function openAndCheck() {
-          modal.style.display = 'flex';
-          document.getElementById('ca-diag-body').textContent = '檢查中...';
-          const report = await runDiagnostics();
-          renderDiagnosticReport(report);
-          const allOk = report.every(function (r) { return r.ok; });
-          btn.style.borderColor = allOk ? '#9DBB92' : '#e2a5a5';
-          btn.style.color = allOk ? '#4C6B43' : '#c0392b';
-        }
+        btn.addEventListener('click', function () { fileInput.click(); });
 
-        btn.addEventListener('click', openAndCheck);
-        document.getElementById('ca-diag-recheck') || null; // 元素在 modal.innerHTML 內，下一行綁定即可
-        modal.querySelector('#ca-diag-recheck').addEventListener('click', openAndCheck);
-        modal.querySelector('#ca-diag-close').addEventListener('click', function () { modal.style.display = 'none'; });
-
-        return { btn, openAndCheck };
+        fileInput.addEventListener('change', async function () {
+          const file = fileInput.files && fileInput.files[0];
+          fileInput.value = '';
+          if (!file) return;
+          try {
+            const text = await file.text();
+            const backupObj = JSON.parse(text);
+            const cases = (backupObj && backupObj.cases) || [];
+            const caseCount = cases.filter(function (c) { return c && c.id; }).length;
+            let monthCount = 0;
+            cases.forEach(function (c) { if (c && c.trackingMonths) monthCount += Object.keys(c.trackingMonths).length; });
+            const ok = window.confirm(
+              '⚠️ 這是破壞性操作，會直接用這份備份覆蓋雲端資料，略過所有「防止舊資料蓋掉新資料」的保護。\n\n' +
+              '檔案內容：' + caseCount + ' 位案主、' + monthCount + ' 筆月份追蹤資料（若有的話，還會一併覆蓋個管名單／單位／範本等共用設定）。\n\n' +
+              '確定要用這份備份覆蓋雲端現在的資料嗎？此動作無法復原。'
+            );
+            if (!ok) return;
+            btn.textContent = '還原中...';
+            const result = await forceRestoreFromBackup(backupObj);
+            window.alert('✅ 還原完成：案主 ' + result.casesRestored + ' 筆、月份追蹤 ' + result.monthsRestored + ' 筆已覆蓋雲端，請重新整理頁面確認。');
+            console.log('[forceRestoreFromBackup] 完成', result);
+          } catch (err) {
+            logSupabaseError('forceRestoreFromBackup', err);
+            window.alert('❌ 還原失敗：' + (err && err.message));
+          } finally {
+            btn.textContent = '還原備份';
+          }
+        });
       }
 
-      let diagPanel = null;
-      let diagAutoRan = false;
-      document.addEventListener('DOMContentLoaded', function () {
-        diagPanel = createDiagnosticPanel();
-      });
-      // 若 DOMContentLoaded 已經觸發過（module script 載入時機較晚時常見），保險起見立刻建立一次
-      if (document.readyState !== 'loading' && !diagPanel) {
-        diagPanel = createDiagnosticPanel();
-      }
-
-      // 登入成功後自動跑一次背景檢查（只跑一次），主控台會看到報告；
-      // 如果有任何一項失敗，畫面左下角的按鈕邊框會自動變紅，提醒使用者點開看。
-      const originalHandleAuthState = handleAuthState;
-      handleAuthState = function (session) {
-        originalHandleAuthState(session);
-        if (session && !diagAutoRan) {
-          diagAutoRan = true;
-          setTimeout(async function () {
-            if (!diagPanel) diagPanel = createDiagnosticPanel();
-            const report = await runDiagnostics();
-            renderDiagnosticReport(report);
-            const allOk = report.every(function (r) { return r.ok; });
-            if (diagPanel && diagPanel.btn) {
-              diagPanel.btn.style.borderColor = allOk ? '#9DBB92' : '#e2a5a5';
-              diagPanel.btn.style.color = allOk ? '#4C6B43' : '#c0392b';
-            }
-          }, 800);
-        }
-      };
+      document.addEventListener('DOMContentLoaded', createRestoreTool);
+      if (document.readyState !== 'loading') createRestoreTool();
 
       window.CareFirebase = { cc: cc, lc: lc };
     </script>
