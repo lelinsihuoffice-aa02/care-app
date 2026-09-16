@@ -373,7 +373,9 @@ Actual: `+e.attribValue);else{var i=e.tag,a=e.tags[e.tags.length-1]||e;i.ns===a.
       async function broadcastMonthUpdates(items, fromClientId) {
         if (!items || !items.length) return;
         try {
-          await getUpdatesChannel().send({ type: 'broadcast', event: 'month-updated', payload: { items: items, from: fromClientId || null } });
+          // httpSend 明確走 REST，不需要等頻道完成 WebSocket 交握才能送出，
+          // 也不會再跳「send() 自動退回 REST」的棄用警告（send() 需要頻道已經 SUBSCRIBED 才會走 WebSocket）。
+          await getUpdatesChannel().httpSend('month-updated', { items: items, from: fromClientId || null });
         } catch (err) {
           logSupabaseError('broadcastMonthUpdates', err);
         }
