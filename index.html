@@ -340,13 +340,17 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
              的 query，資料一有異動全部裝置秒級收到通知。
          ============================================================ -->
     <script type="module">
-      import { ConvexClient } from "https://esm.sh/convex@1.46.0/browser";
+      import { ConvexClient, ConvexHttpClient } from "https://esm.sh/convex@1.46.0/browser";
 
       // ⚠️ 換成你自己的 Convex deployment URL
       // 位置：終端機執行 npx convex dev 時印出的網址，或 .env.local 裡的 CONVEX_URL
       const CONVEX_URL = "https://robust-buzzard-570.convex.cloud";
 
       const client = new ConvexClient(CONVEX_URL);
+      // 登入 / 換 token 這類「還沒驗證」的呼叫一律走 HTTP，不能走 WebSocket：
+      // client.setAuth() 會先暫停 WebSocket 等 fetchToken 完成，若 fetchToken 裡又用
+      // client.action（走 WebSocket）就會互相等待、永遠卡住（Convex Auth 官方 React 客戶端也是這樣處理）。
+      const httpClient = new ConvexHttpClient(CONVEX_URL);
 
       function logConvexError(where, err) {
         console.error("[雲端錯誤] " + where + "：" + (err && err.message), err);
@@ -362,23 +366,30 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
 
       // Convex client 需要的 fetchToken：每次要送出已驗證的請求前會呼叫這個函式
       // 拿目前有效的 token；forceRefreshToken 代表舊 token 已經失效，要求換一組新的。
+      let refreshInFlight = null;
       async function fetchToken({ forceRefreshToken }) {
         if (!forceRefreshToken && currentToken) return currentToken;
+        // refresh token 是一次性的：若 setAuth 內部與 tryAutoLogin 同時各換一次，第二次會失敗，
+        // 所以同一時間只允許一個換 token 的請求，其他呼叫共用它的結果。
+        if (refreshInFlight) return refreshInFlight;
         const rt = localStorage.getItem(REFRESH_KEY);
         if (!rt) return null;
-        try {
-          const result = await client.action('auth:signIn', { refreshToken: rt });
-          if (result && result.tokens) {
-            currentToken = result.tokens.token;
-            localStorage.setItem(REFRESH_KEY, result.tokens.refreshToken);
-            return currentToken;
+        refreshInFlight = (async function () {
+          try {
+            const result = await httpClient.action('auth:signIn', { refreshToken: rt });
+            if (result && result.tokens) {
+              currentToken = result.tokens.token;
+              localStorage.setItem(REFRESH_KEY, result.tokens.refreshToken);
+              return currentToken;
+            }
+          } catch (err) {
+            logConvexError('fetchToken(refresh)', err);
           }
-        } catch (err) {
-          logConvexError('fetchToken(refresh)', err);
-        }
-        localStorage.removeItem(REFRESH_KEY);
-        currentToken = null;
-        return null;
+          localStorage.removeItem(REFRESH_KEY);
+          currentToken = null;
+          return null;
+        })().finally(function () { refreshInFlight = null; });
+        return refreshInFlight;
       }
       client.setAuth(fetchToken);
 
@@ -418,7 +429,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
         var btn = document.getElementById('ca-auth-btn');
         btn.disabled = true; btn.textContent = '登入中...';
         try {
-          const result = await client.action('auth:signIn', {
+          const result = await httpClient.action('auth:signIn', {
             provider: 'password',
             params: { email: SHARED_EMAIL, password: pw, flow: 'signIn' },
           });
