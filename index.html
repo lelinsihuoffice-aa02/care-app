@@ -738,25 +738,73 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       // 自動收到新的清單，跟上一次收到的內容做差集，只把「新出現的」
       // 項目通知給呼叫端（跟原本 broadcast 的行為對應）
       // ============================================================
+      // ---- 省 Database I/O 的改良版 ----
+      // 舊做法訂閱 recentUpdates 且起始時間固定在「開網頁那一刻」：整個上班日裡，只要
+      // 有人再存一次月份紀錄，就會把「開網頁以來所有被更新過的月份」全部重讀、全部重新通知。
+      // 新做法：只訂閱 trackingMonths:latestUpdatedAt（伺服器只讀 1 筆、回傳一個數字），
+      // 收到變動後才一次性查 recentUpdates({ sinceMs })，而且只通知「新出現」的月份。
       let _monthUpdateHandler = null;
-      let _seenUpdatedAt = Date.now();
+      let _seenUpdatedAt = 0;           // 已處理到的最新 updatedAt（以伺服器時間為準）
+      let _monthBaselineSet = false;    // 第一次訊號只用來建立基準點，不通知
+      let _monthSeedPromise = null;     // 基準點前 5 秒內已存在的月份：先標記為已知，避免剛開網頁就重複通知
       let _unsubscribeRecent = null;
+      let _monthSyncing = false;
+      let _monthSyncAgain = false;
+      const _monthNotified = new Map(); // caseId/monthKey -> 已通知過的 updatedAt
+      const MONTH_SINCE_OVERLAP_MS = 5000;
+
+      async function _syncMonthUpdates() {
+        if (_monthSyncing) { _monthSyncAgain = true; return; }
+        _monthSyncing = true;
+        try {
+          if (_monthSeedPromise) await _monthSeedPromise;
+          do {
+            _monthSyncAgain = false;
+            const rows = await client.query('trackingMonths:recentUpdates', {
+              sinceMs: Math.max(0, _seenUpdatedAt - MONTH_SINCE_OVERLAP_MS),
+            });
+            const items = [];
+            let maxTs = _seenUpdatedAt;
+            (rows || []).forEach(function (r) {
+              const k = r.caseId + '/' + r.monthKey;
+              if ((_monthNotified.get(k) || 0) < r.updatedAt) {
+                _monthNotified.set(k, r.updatedAt);
+                items.push({ caseId: r.caseId, monthKey: r.monthKey });
+              }
+              if (r.updatedAt > maxTs) maxTs = r.updatedAt;
+            });
+            _seenUpdatedAt = maxTs;
+            if (items.length && _monthUpdateHandler) {
+              try { _monthUpdateHandler({ items: items }); }
+              catch (err) { console.error('[即時通知] 處理失敗：', err); }
+            }
+          } while (_monthSyncAgain);
+        } catch (err) {
+          logConvexError('onMonthUpdate', err);
+        } finally {
+          _monthSyncing = false;
+        }
+      }
 
       function onMonthUpdate(callback) {
         _monthUpdateHandler = callback;
         if (!_unsubscribeRecent) {
           _unsubscribeRecent = client.onUpdate(
-            'trackingMonths:recentUpdates',
-            { sinceMs: _seenUpdatedAt - 5000 },
-            function (rows) {
-              if (!rows || !rows.length) return;
-              const maxTs = rows.reduce(function (m, r) { return Math.max(m, r.updatedAt); }, _seenUpdatedAt);
-              const items = rows.map(function (r) { return { caseId: r.caseId, monthKey: r.monthKey }; });
-              _seenUpdatedAt = maxTs;
-              if (_monthUpdateHandler) {
-                try { _monthUpdateHandler({ items: items }); }
-                catch (err) { console.error('[即時通知] 處理失敗：', err); }
+            'trackingMonths:latestUpdatedAt',
+            {},
+            function (signal) {
+              const latest = (signal && signal[0]) || 0;
+              if (!_monthBaselineSet) {
+                _monthBaselineSet = true;
+                _seenUpdatedAt = latest;
+                _monthSeedPromise = client.query('trackingMonths:recentUpdates', {
+                  sinceMs: Math.max(0, latest - MONTH_SINCE_OVERLAP_MS),
+                }).then(function (rows) {
+                  (rows || []).forEach(function (r) { _monthNotified.set(r.caseId + '/' + r.monthKey, r.updatedAt); });
+                }).catch(function (err) { logConvexError('onMonthUpdate(baseline)', err); });
+                return;
               }
+              _syncMonthUpdates();
             },
             function (err) { logConvexError('onMonthUpdate', err); }
           );
@@ -775,20 +823,67 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       // 「有沒有變」或多久檢查一次。
       // 回傳 unsubscribe 函式，元件卸載時記得呼叫。
       // ============================================================
+      // ---- 省 Database I/O 的改良版 ----
+      // 舊做法直接訂閱整份 cases:list：任何一個個案異動（連勾選都算），伺服器就把
+      // 「整張 cases 表」重新讀一次，用量 = 清單大小 × 異動次數。
+      // 新做法：只訂閱 cases:changeSignal（伺服器只讀 1 筆文件、回傳一個數字）。
+      // 收到「有變動」的訊號後，再用 cases:list({ since }) 只抓有變動的個案，合併進本機
+      // 快取，最後仍以「完整清單」呼叫 callback —— App 端的處理邏輯完全不用改。
       let _unsubscribeCasesList = null;
       let _casesListHandler = null;
+      let _casesCache = new Map();     // caseId -> 雲端 row
+      let _casesMaxUpdatedAt = 0;      // 快取內最新的 updatedAt
+      let _casesInitialized = false;   // 是否已完成第一次完整載入
+      let _casesSyncing = false;
+      let _casesSyncAgain = false;
+      const CASES_SINCE_OVERLAP_MS = 5000; // 往前多抓 5 秒，避免同毫秒/時間差造成漏抓
+
+      async function _syncCasesList(onError) {
+        if (_casesSyncing) { _casesSyncAgain = true; return; }
+        _casesSyncing = true;
+        try {
+          do {
+            _casesSyncAgain = false;
+            let rows;
+            const wasInitialized = _casesInitialized;
+            if (!_casesInitialized) {
+              rows = await client.query('cases:list', { all: true });
+              _casesCache = new Map();
+              _casesMaxUpdatedAt = 0;
+            } else {
+              rows = await client.query('cases:list', {
+                since: Math.max(0, _casesMaxUpdatedAt - CASES_SINCE_OVERLAP_MS),
+              });
+            }
+            rows.forEach(function (r) {
+              const old = _casesCache.get(r.caseId);
+              if (!old || r.updatedAt >= old.updatedAt) _casesCache.set(r.caseId, r);
+              if (r.updatedAt > _casesMaxUpdatedAt) _casesMaxUpdatedAt = r.updatedAt;
+            });
+            _casesInitialized = true;
+            if (wasInitialized && rows.length === 0) continue; // 沒有新資料（例如只是刪除）→ 不必通知
+            if (_casesListHandler) {
+              try { _casesListHandler(Array.from(_casesCache.values()).map(rowToCase)); }
+              catch (err) { console.error('[即時通知] 個案清單處理失敗：', err); }
+            }
+          } while (_casesSyncAgain);
+        } catch (err) {
+          logConvexError('subscribeCasesList', err);
+          onError && onError(err);
+        } finally {
+          _casesSyncing = false;
+        }
+      }
 
       function subscribeCasesList(callback, onError) {
         _casesListHandler = callback;
         if (!_unsubscribeCasesList) {
           _unsubscribeCasesList = client.onUpdate(
-            'cases:list',
-            { all: true },
-            function (rows) {
-              if (_casesListHandler) {
-                try { _casesListHandler(rows.map(rowToCase)); }
-                catch (err) { console.error('[即時通知] 個案清單處理失敗：', err); }
-              }
+            'cases:changeSignal',
+            {},
+            function (_signal) {
+              // _signal = 最新 5 筆的 updatedAt；內容一有變就會進來，直接做一次增量同步
+              _syncCasesList(onError);
             },
             function (err) {
               logConvexError('subscribeCasesList', err);
