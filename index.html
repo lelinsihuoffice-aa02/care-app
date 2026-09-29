@@ -599,10 +599,25 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       // ============================================================
       async function loadCases(params) {
         params = params || {};
+        const beforeFetchAll_ = Date.now();
         const rows = await client.query('cases:list', {
           since: params.since ? Number(params.since) : undefined,
           all: params.all === '1',
         });
+        // 完整讀取的結果就是雲端「現在」的正確清單：順便重建即時訂閱用的快取，
+        // 否則快取裡殘留的舊個案（幽靈個案）或缺少的個案，會在下一次即時推播時
+        // 又把畫面蓋回錯的清單。
+        if (params.all === '1') {
+          _casesCache = new Map();
+          _casesMaxUpdatedAt = 0;
+          rows.forEach(function (r) {
+            _casesCache.set(r.caseId, r);
+            if (r.updatedAt > _casesMaxUpdatedAt) _casesMaxUpdatedAt = r.updatedAt;
+          });
+          _casesMaxTombstoneAt = Math.max(_casesMaxTombstoneAt, beforeFetchAll_);
+          _casesInitialized = true;
+          _persistCasesSyncMarks();
+        }
         return {
           cases: rows.map(rowToCase),
           incremental: !!params.since,
@@ -886,6 +901,21 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       let _casesMaxTombstoneAt = 0;    // 墓碑快取內最新的 deletedAt
       let _unsubscribeTombstones = null;
 
+      // 把「雲端同步到哪裡」記在本機，下次開網頁才能接著同步，而不是用本機個案
+      // 裡最大的 updatedAt 猜（那個值可能來自本機自己的修改，會跳過別人的變更）。
+      // 延遲一下再寫，確保畫面已經把最新清單存進本機 cases 之後才更新進度。
+      let _persistMarksTimer = null;
+      function _persistCasesSyncMarks() {
+        if (_persistMarksTimer) clearTimeout(_persistMarksTimer);
+        _persistMarksTimer = setTimeout(function () {
+          _persistMarksTimer = null;
+          try {
+            localStorage.setItem('caCasesSyncTs', String(_casesMaxUpdatedAt));
+            localStorage.setItem('caTombstoneTs', String(_casesMaxTombstoneAt));
+          } catch (e) {}
+        }, 1500);
+      }
+
       // 問雲端「這個時間點之後，有哪些個案被刪除了」，把結果從 _casesCache 移除。
       // 回傳「有沒有真的刪除到東西」，讓呼叫端知道就算沒有新增/修改的個案，
       // 也可能因為有人刪除而需要通知前端更新畫面。
@@ -903,8 +933,6 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
           if (_casesCache.delete(t.caseId)) removedAny = true;
           if (t.deletedAt > _casesMaxTombstoneAt) _casesMaxTombstoneAt = t.deletedAt;
         });
-        // 墓碑進度另外記在本機，不再借用 lastSyncTs，避免舊的刪除紀錄被跳過
-        try { localStorage.setItem('caTombstoneTs', String(_casesMaxTombstoneAt)); } catch (e) {}
         return removedAny;
       }
 
@@ -942,6 +970,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
               try { _casesListHandler(Array.from(_casesCache.values()).map(rowToCase)); }
               catch (err) { console.error('[即時通知] 個案清單處理失敗：', err); }
             }
+            _persistCasesSyncMarks();
           } while (_casesSyncAgain);
         } catch (err) {
           logConvexError('subscribeCasesList', err);
@@ -961,7 +990,14 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       // 就照舊做一次完整讀取，行為不變、不會有資料錯誤的風險。
       function subscribeCasesList(callback, onError, seed) {
         _casesListHandler = callback;
-        if (!_casesInitialized && seed && Array.isArray(seed.cases) && seed.cases.length && typeof seed.sinceMs === 'number') {
+        let savedSyncTs_ = 0, savedTombTs_ = 0;
+        try {
+          savedSyncTs_ = Number(localStorage.getItem('caCasesSyncTs')) || 0;
+          savedTombTs_ = Number(localStorage.getItem('caTombstoneTs')) || 0;
+        } catch (e) {}
+        // 沒有同步進度紀錄（第一次用新版、或清過資料）→ 不沿用本機快取，
+        // 直接完整讀取一次，把本機的幽靈個案、漏掉的個案一次校正。
+        if (!_casesInitialized && savedSyncTs_ > 0 && seed && Array.isArray(seed.cases) && seed.cases.length) {
           _casesCache = new Map();
           seed.cases.forEach(function (c) {
             try {
@@ -975,11 +1011,8 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
               if (payload.expectedUpdatedAt > _casesMaxUpdatedAt) _casesMaxUpdatedAt = payload.expectedUpdatedAt;
             } catch (e) { /* 單筆本機資料格式異常就跳過，不影響其他筆 */ }
           });
-          _casesMaxUpdatedAt = Math.max(_casesMaxUpdatedAt, seed.sinceMs);
-          // 用本機另外記錄的墓碑進度；沒記錄過（例如舊版升級上來）就從 0 開始查一次，
-          // 把本機快取裡已被刪除的「幽靈個案」清掉，之後每筆刪除紀錄只會讀一次。
-          var savedTombTs_ = 0;
-          try { savedTombTs_ = Number(localStorage.getItem('caTombstoneTs')) || 0; } catch (e) {}
+          // 從上次「雲端確實同步到」的時間點接著抓，不用本機個案裡最大的 updatedAt
+          _casesMaxUpdatedAt = savedSyncTs_;
           _casesMaxTombstoneAt = savedTombTs_;
           _casesInitialized = true;
         }
