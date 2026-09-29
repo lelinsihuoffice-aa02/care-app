@@ -903,6 +903,8 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
           if (_casesCache.delete(t.caseId)) removedAny = true;
           if (t.deletedAt > _casesMaxTombstoneAt) _casesMaxTombstoneAt = t.deletedAt;
         });
+        // 墓碑進度另外記在本機，不再借用 lastSyncTs，避免舊的刪除紀錄被跳過
+        try { localStorage.setItem('caTombstoneTs', String(_casesMaxTombstoneAt)); } catch (e) {}
         return removedAny;
       }
 
@@ -974,7 +976,11 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
             } catch (e) { /* 單筆本機資料格式異常就跳過，不影響其他筆 */ }
           });
           _casesMaxUpdatedAt = Math.max(_casesMaxUpdatedAt, seed.sinceMs);
-          _casesMaxTombstoneAt = seed.sinceMs;
+          // 用本機另外記錄的墓碑進度；沒記錄過（例如舊版升級上來）就從 0 開始查一次，
+          // 把本機快取裡已被刪除的「幽靈個案」清掉，之後每筆刪除紀錄只會讀一次。
+          var savedTombTs_ = 0;
+          try { savedTombTs_ = Number(localStorage.getItem('caTombstoneTs')) || 0; } catch (e) {}
+          _casesMaxTombstoneAt = savedTombTs_;
           _casesInitialized = true;
         }
         if (!_unsubscribeCasesList) {
