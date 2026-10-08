@@ -418,6 +418,11 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       const REFRESH_KEY = 'caConvexRefreshToken';
 
       let currentToken = null;
+      // 讀寫資料前先等「登入完成」：網頁一打開就會去雲端抓資料，
+      // 若這時還沒登入（或登入憑證還在換新），伺服器會回「未登入」，
+      // 這裡讓那些請求先排隊，登入成功後才真正送出。
+      let _authResolve;
+      const authReady = new Promise(function (r) { _authResolve = r; });
 
       // Convex client 需要的 fetchToken：每次要送出已驗證的請求前會呼叫這個函式
       // 拿目前有效的 token；forceRefreshToken 代表舊 token 已經失效，要求換一組新的。
@@ -433,7 +438,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
           try {
             const result = await httpClient.action('auth:signIn', { refreshToken: rt });
             if (result && result.tokens) {
-              currentToken = result.tokens.token;
+              currentToken = result.tokens.token; _authResolve();
               localStorage.setItem(REFRESH_KEY, result.tokens.refreshToken);
               return currentToken;
             }
@@ -502,12 +507,11 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
             params: { email: SHARED_EMAIL, password: pw, flow: 'signIn' },
           });
           if (result && result.tokens) {
-            currentToken = result.tokens.token;
+            currentToken = result.tokens.token; _authResolve();
             localStorage.setItem(REFRESH_KEY, result.tokens.refreshToken);
             client.setAuth(fetchToken);
             hideGate();
             ensureUserName();
-            caReloadAfterAuth();
           } else {
             throw new Error('登入回應格式異常');
           }
@@ -706,6 +710,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
 
       async function cc(action, params) {
         params = params || {};
+        await authReady;
         try {
           if (action === 'loadCases') return await loadCases(params);
           if (action === 'loadCaseMonths') return await loadCaseMonths(params.caseId);
@@ -792,6 +797,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
 
       async function lc(payload) {
         payload = payload || {};
+        await authReady;
         let action = payload.action;
         if (!action && (payload.cases || payload.months)) action = 'saveBatch';
         let data;
