@@ -424,6 +424,16 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       let _authResolve;
       const authReady = new Promise(function (r) { _authResolve = r; });
 
+      // 即時訂閱也要等登入完成才建立：若在登入前就訂閱，伺服器會回「未登入」錯誤，
+      // 而且這個錯誤會被暫存，之後同一個查詢（例如「從雲端載入」讀設定）會直接拿到這份舊錯誤。
+      function onUpdateAfterAuth(name, args, cb, errCb) {
+        var unsub = null, cancelled = false;
+        authReady.then(function () {
+          if (!cancelled) unsub = client.onUpdate(name, args, cb, errCb);
+        });
+        return function () { cancelled = true; if (unsub) unsub(); };
+      }
+
       // Convex client 需要的 fetchToken：每次要送出已驗證的請求前會呼叫這個函式
       // 拿目前有效的 token；forceRefreshToken 代表舊 token 已經失效，要求換一組新的。
       let refreshInFlight = null;
@@ -708,7 +718,21 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
         await client.mutation('config:touchStatus', { clientId: clientId, who: who });
       }
 
+      // 讀取時若伺服器剛好還沒認到登入狀態（剛登入的前一兩秒），稍等再重試，最多 6 次
       async function cc(action, params) {
+        for (var i = 0; ; i++) {
+          try { return await ccInner_(action, params); }
+          catch (err) {
+            if (i < 6 && /未登入/.test((err && err.message) || '')) {
+              await new Promise(function (r) { setTimeout(r, 1000); });
+              continue;
+            }
+            throw err;
+          }
+        }
+      }
+
+      async function ccInner_(action, params) {
         params = params || {};
         await authReady;
         try {
@@ -879,7 +903,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       function onMonthUpdate(callback) {
         _monthUpdateHandler = callback;
         if (!_unsubscribeRecent) {
-          _unsubscribeRecent = client.onUpdate(
+          _unsubscribeRecent = onUpdateAfterAuth(
             'trackingMonths:latestUpdatedAt',
             {},
             function (signal) {
@@ -1046,7 +1070,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
           _casesInitialized = true;
         }
         if (!_unsubscribeCasesList) {
-          _unsubscribeCasesList = client.onUpdate(
+          _unsubscribeCasesList = onUpdateAfterAuth(
             'cases:changeSignal',
             {},
             function (_signal) {
@@ -1060,7 +1084,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
           );
         }
         if (!_unsubscribeTombstones) {
-          _unsubscribeTombstones = client.onUpdate(
+          _unsubscribeTombstones = onUpdateAfterAuth(
             'cases:tombstoneSignal',
             {},
             function (_signal) {
@@ -1078,7 +1102,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
           // 如果是用 seed 立刻標成已初始化（或本來就已經初始化過），
           // 這裡主動補做一次同步：用的是（便宜的）增量路徑，把 seed 之後
           // 錯過的新增/修改/刪除都補齊，確保不會因為只信任本機快取而漏資料。
-          _syncCasesList(onError);
+          authReady.then(function () { _syncCasesList(onError); });
         }
         return function unsubscribe() {
           if (_casesListHandler === callback) _casesListHandler = null;
@@ -1092,7 +1116,7 @@ let c=[];e.forEach(e=>{let t=e.trackingMonths?.[o];t&&(t.services||[]).forEach(t
       // 導致區域指派等設定變更不會即時同步到其他裝置，這裡補上。
       // ============================================================
       function subscribeMeta(callback, onError) {
-        return client.onUpdate(
+        return onUpdateAfterAuth(
           'config:getMeta',
           {},
           function (row) {
